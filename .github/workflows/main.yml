@@ -1,3 +1,4 @@
+
 name: Compilar PhotoCraft Android PT-BR
 
 on:
@@ -11,12 +12,27 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 120
 
     steps:
-      - name: Baixar arquivos do repositorio
+      - name: Baixar arquivos
         uses: actions/checkout@v4
+
+      - name: Localizar e extrair projeto
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path . -Filter "PhotoCraft-Android-PTBR-compilacao-automatica.zip" -Recurse | Select-Object -First 1
+          if (-not $zip) {
+            throw "ZIP do PhotoCraft nao encontrado."
+          }
+          $dest = Join-Path $env:RUNNER_TEMP "photocraft"
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $dest -Force
+          $source = Join-Path $dest "photocraft-for-android-main"
+          if (-not (Test-Path (Join-Path $source "packaging/android/build.ps1"))) {
+            throw "O script de compilacao nao foi encontrado."
+          }
+          "SOURCE_DIR=$source" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Preparar Java
         uses: actions/setup-java@v4
@@ -24,39 +40,58 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-            - name: Instalar Android SDK
+      - name: Preparar Android SDK
         uses: android-actions/setup-android@v3
         with:
-          accept-android-sdk-licenses: false
-
-      - name: Aceitar licencas Android
-        run: yes | sdkmanager --licenses
+          accept-android-sdk-licenses: true
 
       - name: Instalar ferramentas Android
         shell: pwsh
         run: |
           sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
 
-      - name: Extrair projeto
+      - name: Preparar Rust
+        shell: pwsh
+        env:
+          RUSTUP_HOME: ${{ runner.temp }}\rustup
+          CARGO_HOME: ${{ runner.temp }}\cargo
+        run: |
+          rustup toolchain install 1.95.0-x86_64-pc-windows-gnullvm --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "Falha ao instalar Rust." }
+          rustup target add aarch64-linux-android --toolchain 1.95.0-x86_64-pc-windows-gnullvm
+          if ($LASTEXITCODE -ne 0) { throw "Falha ao instalar alvo Android." }
+
+      - name: Preparar compilador nativo
+        id: llvm
         shell: pwsh
         run: |
-          $zip = Get-ChildItem -Path . -Filter "PhotoCraft-Android-PTBR-compilacao-automatica.zip" -Recurse | Select-Object -First 1
-          if (-not $zip) { throw "O ZIP do projeto nao foi encontrado no repositorio." }
-          Expand-Archive -LiteralPath $zip.FullName -DestinationPath "$env:RUNNER_TEMP\photocraft" -Force
-          $source = Join-Path "$env:RUNNER_TEMP\photocraft" "photocraft-for-android-main"
-          if (-not (Test-Path "$source\packaging\android\build.ps1")) { throw "O projeto Android nao foi encontrado dentro do ZIP." }
-          "SOURCE_DIR=$source" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -match "ucrt-x86_64\.zip$" } | Select-Object -First 1
+          if (-not $asset) { throw "Pacote LLVM-MinGW nao encontrado." }
+          $archive = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+          $dest = Join-Path $env:RUNNER_TEMP "llvm-mingw"
+          Expand-Archive -LiteralPath $archive -DestinationPath $dest -Force
+          $root = Get-ChildItem $dest -Directory | Select-Object -First 1
+          "llvm_root=$($root.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Instalar Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
-
-      - name: Compilar APK
+      - name: Compilar APK ARM64
         shell: pwsh
+        env:
+          RUSTUP_HOME: ${{ runner.temp }}\rustup
+          CARGO_HOME: ${{ runner.temp }}\cargo
+          CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
+          PHOTOCRAFT_RUSTUP_HOME: ${{ runner.temp }}\rustup
+          PHOTOCRAFT_CARGO_HOME: ${{ runner.temp }}\cargo
+          PHOTOCRAFT_CARGO_TARGET_DIR: ${{ runner.temp }}\cargo-target
+          PHOTOCRAFT_LLVM_MINGW: ${{ steps.llvm.outputs.llvm_root }}
         run: |
+          $env:PHOTOCRAFT_JAVA_HOME = $env:JAVA_HOME
+          $env:PHOTOCRAFT_ANDROID_HOME = $env:ANDROID_HOME
+          $env:PHOTOCRAFT_NDK_HOME = Join-Path $env:ANDROID_HOME "ndk\28.2.13676358"
           Set-Location $env:SOURCE_DIR
-          .\packaging\android\build.ps1 -Abi arm64-v8a -Jobs 2
+          ./packaging/android/build.ps1 -ToolsRoot (Join-Path $env:RUNNER_TEMP "photocraft-build") -Abi arm64-v8a -Jobs 2
+          if ($LASTEXITCODE -ne 0) { throw "A compilacao do APK falhou." }
 
       - name: Disponibilizar APK
         uses: actions/upload-artifact@v4
@@ -65,3 +100,4 @@ jobs:
           path: ${{ runner.temp }}/photocraft/photocraft-for-android-main/dist/android/*.apk
           if-no-files-found: error
           retention-days: 14
+          
